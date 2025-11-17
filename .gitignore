@@ -1,0 +1,17 @@
+# --- Secrets ---
+# Ignore the local config file that contains real passwords!
+config.py
+
+# --- Cache Files ---
+# Ignore the local database file and any log files
+*.db
+*.jsonl
+
+# --- MicroPython Files ---
+# Ignore compiled MicroPython files
+*.pyc
+
+# --- IDE / OS Files ---
+.vscode/
+.idea/
+.DS_Store
