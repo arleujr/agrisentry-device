@@ -1,38 +1,17 @@
-# boot.py
-#
-# This script runs on device boot-up.
-# Its sole responsibility is to connect the device to the Wi-Fi network.
-# The main application logic is in main.py.
+"""ESP32 boot sequence: connect Wi-Fi and synchronize the UTC clock."""
 
-import network
-import time
-from config import WIFI_SSID, WIFI_PASSWORD
+import config
 
-# Define a connection timeout in seconds
-WIFI_TIMEOUT_SECONDS = 15
+from networking import connect_wifi
+from time_sync import sync_utc_clock
 
-print("--- AgriSentry Field Agent Booting ---")
+print("[BOOT] AgriSentry Device v2 starting")
 
-# Initialize the station interface
-wlan = network.WLAN(network.STA_IF)
-wlan.active(True)
+connect_wifi(
+    config.WIFI_SSID,
+    config.WIFI_PASSWORD,
+    timeout_seconds=getattr(config, "WIFI_CONNECT_TIMEOUT_SECONDS", 20),
+)
 
-if not wlan.isconnected():
-    print(f"Connecting to Wi-Fi network: {WIFI_SSID}...")
-    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-    
-    # Wait for the connection to establish, with a timeout
-    wait_start_time = time.time()
-    while not wlan.isconnected():
-        if time.time() - wait_start_time > WIFI_TIMEOUT_SECONDS:
-            print("\n[FAILURE] Wi-Fi connection timed out.")
-            break
-        time.sleep(1)
-
-# Check the final status and log the outcome
-if wlan.isconnected():
-    print(f"\n[SUCCESS] Wi-Fi connected. Network config: {wlan.ifconfig()}")
-else:
-    print("\n[FAILURE] Failed to connect to Wi-Fi.")
-
-print("--- Boot sequence finished. Starting main.py ---")
+sync_utc_clock()
+print("[BOOT] Boot sequence completed")

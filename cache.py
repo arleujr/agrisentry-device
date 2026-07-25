@@ -1,56 +1,64 @@
-import uos
-import json
+"""Offline JSONL cache for complete MQTT v1 telemetry envelopes."""
 
-CACHE_FILE = "readings_cache.jsonl" # JSON Lines format
+try:
+    import ujson as json
+except ImportError:
+    import json
 
-def save_reading(value, timestamp):
-    """
-    Saves a single sensor reading as a new line in the cache file.
-    Uses 'append' mode ('a') for file system efficiency.
-    """
-    reading_data = {
-        "value": value,
-        "timestamp": timestamp,
-        "sensor_type": "SOIL_MOISTURE_OFFLINE"
-    }
-    try:
-        # 'a' = append mode, adds to the end of the file
-        with open(CACHE_FILE, "a") as f:
-            f.write(json.dumps(reading_data) + "\n") # Write the JSON and a newline
-        print(f"[CACHE] Offline reading saved: {value}")
-    except Exception as e:
-        print(f"[CACHE] Error saving reading: {e}")
+try:
+    import uos as os
+except ImportError:
+    import os
 
-def get_unsent_readings():
-    """
-    Reads all lines from the cache and returns them as a list of strings.
-    """
-    try:
-        # 'r' = read mode
-        with open(CACHE_FILE, "r") as f:
-            lines = f.readlines()
-        if lines:
-            print(f"[CACHE] Found {len(lines)} unsent readings.")
-            return lines
-        else:
+
+class TelemetryCache:
+    """Append, replay and safely retain unsent telemetry payloads."""
+
+    def __init__(self, path="telemetry_cache.jsonl"):
+        self.path = path
+        self.temporary_path = path + ".tmp"
+
+    def append(self, envelope):
+        with open(self.path, "a") as file_handle:
+            file_handle.write(json.dumps(envelope))
+            file_handle.write("\n")
+
+    def load(self):
+        payloads = []
+
+        try:
+            with open(self.path, "r") as file_handle:
+                for line in file_handle:
+                    line = line.strip()
+                    if line:
+                        payloads.append(json.loads(line))
+        except OSError:
             return []
-    except OSError:
-        # [Errno 2] ENOENT: File does not exist, which is normal if no cache exists.
-        print("[CACHE] No cache file found.")
-        return []
-    except Exception as e:
-        print(f"[CACHE] Error reading cache: {e}")
-        return []
 
-def clear_cache():
-    """
-    Deletes the cache file. Called after a successful sync.
-    """
-    try:
-        uos.remove(CACHE_FILE)
-        print("[CACHE] Cache cleared successfully.")
-    except OSError:
-        # File already deleted or never existed. This is fine.
-        pass
-    except Exception as e:
-        print(f"[CACHE] Error clearing cache: {e}")
+        return payloads
+
+    def replace(self, payloads):
+        if not payloads:
+            self.clear()
+            return
+
+        with open(self.temporary_path, "w") as file_handle:
+            for payload in payloads:
+                file_handle.write(json.dumps(payload))
+                file_handle.write("\n")
+
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+        os.rename(self.temporary_path, self.path)
+
+    def clear(self):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+    def count(self):
+        return len(self.load())

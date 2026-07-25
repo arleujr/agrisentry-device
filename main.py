@@ -1,229 +1,169 @@
+"""AgriSentry Device v2 first vertical slice.
+
+This version publishes all seven telemetry channels using simulated values.
+Physical sensor drivers and actuator commands are added in later slices.
+"""
+
 import time
-import machine
-import ubinascii
-import json
-import dht
-from machine import Pin, ADC
+
+import config
+from cache import TelemetryCache
+from networking import ensure_wifi
+from sequence_store import SequenceStore
+from simulated_sensors import read_all
+from telemetry import build_envelope, serialize
+from time_sync import sync_utc_clock, utc_now_iso
 from umqtt.simple import MQTTClient
-from config import MQTT_BROKER, MQTT_USER, MQTT_PASSWORD
-import cache
 
-print("--- Starting AgriSentry Field Agent (Hardware + Security) ---")
+DEVICE_ID = config.DEVICE_ID
+TELEMETRY_TOPIC = "agrisentry/v1/devices/%s/telemetry" % DEVICE_ID
 
-# --- Hardware Initialization ---
-try:
-    sensor_dht = dht.DHT11(Pin(4))
-    adc_solo = ADC(Pin(34))
-    adc_solo.atten(ADC.ATTN_11DB)
-    rele_pin = Pin(26, Pin.OUT)
-    rele_pin.on() # Failsafe: Set pin HIGH to keep active-low relay OFF on boot.
-except Exception as e:
-    print(f"[FATAL ERROR] Failed to initialize pins: {e}. Resetting in 10s.")
-    time.sleep(10)
-    machine.reset()
-
-# --- Global State ---
-current_rule = None
+sequence_store = SequenceStore()
+telemetry_cache = TelemetryCache()
 mqtt_client = None
-loop_counter = 0
 
-# --- Hardware Logic ---
 
-def convert_soil_to_percentage(raw_value, val_max_dry=4095, val_min_wet=1500):
-    """ Converts raw ADC reading to a 0-100% moisture value. """
-    percentage = 100 * (val_max_dry - raw_value) / (val_max_dry - val_min_wet)
-    if percentage < 0: return 0
-    if percentage > 100: return 100
-    return round(percentage, 2)
+def build_client():
+    """Create and connect the MQTT client."""
+    client_id = "agrisentry-device-%s" % DEVICE_ID
 
-def read_sensors():
-    """ Reads all physical sensors and returns a data dictionary. """
-    try:
-        sensor_dht.measure()
-        temperatura = sensor_dht.temperature()
-        umidade_ar = sensor_dht.humidity()
-        
-        valor_solo_raw = adc_solo.read()
-        umidade_solo = convert_soil_to_percentage(valor_solo_raw)
-        
-        print(f"[SENSOR] Read: {temperatura}°C, {umidade_ar}% Air, {umidade_solo}% Soil")
-        return {"TEMPERATURE": temperatura, "HUMIDITY": umidade_ar, "SOIL_MOISTURE": umidade_solo}
-    except Exception as e:
-        print(f"[SENSOR ERROR] Failed to read sensors: {e}")
-        return None
+    client = MQTTClient(
+        client_id=client_id,
+        server=config.MQTT_BROKER,
+        port=getattr(config, "MQTT_PORT", 1883),
+        user=getattr(config, "MQTT_USER", None),
+        password=getattr(config, "MQTT_PASSWORD", None),
+        keepalive=getattr(config, "MQTT_KEEPALIVE_SECONDS", 30),
+        ssl=getattr(config, "MQTT_TLS", False),
+    )
+    client.connect()
 
-def control_relay(state):
-    """ Controls the physical relay (assumes active-low). """
-    if state:
-        rele_pin.off() # Set pin LOW to turn relay ON
-        print("[ACTION] Relay: ON")
-    else:
-        rele_pin.on()  # Set pin HIGH to turn relay OFF
-        print("[ACTION] Relay: OFF")
+    print("[MQTT] Connected to %s:%s" % (
+        config.MQTT_BROKER,
+        getattr(config, "MQTT_PORT", 1883),
+    ))
+    return client
 
-def evaluate_rule(sensor_readings):
-    """ Evaluates the current rule against new sensor data. """
-    if not current_rule or not sensor_readings:
-        control_relay(False) # Failsafe
-        return
 
-    try:
-        condition = current_rule.get('condition')
-        threshold = current_rule.get('threshold')
-        action = current_rule.get('action')
-        
-        # Rule logic is currently hardcoded to SOIL_MOISTURE
-        sensor_value = sensor_readings.get("SOIL_MOISTURE")
-        if sensor_value is None:
-            return 
-            
-        should_activate = False
-        if condition == "LESS_THAN" and sensor_value < threshold:
-            should_activate = True
-        elif condition == "GREATER_THAN" and sensor_value > threshold:
-            should_activate = True
-        
-        print(f"[LOGIC] Evaluating: {sensor_value} (Soil) {condition} {threshold}? -> Activate: {should_activate}")
-
-        if should_activate:
-            control_relay(action == "TURN_ON")
-        else:
-            control_relay(action == "TURN_OFF")
-    
-    except Exception as e:
-        print(f"[ERROR] Failed to evaluate rule: {e}")
-
-# --- Connectivity & Caching Logic ---
-
-def on_message(topic, msg):
-    """ Callback for handling subscribed MQTT messages. """
-    global current_rule
-    topic_str = topic.decode()
-    payload_str = msg.decode()
-    
-    print(f"\n[MQTT] Message received!")
-    print(f"   > Topic: {topic_str}")
-
-    if topic_str.endswith("/config/set"):
-        print(f"   > Config Payload: {payload_str}")
-        try:
-            rule = json.loads(payload_str)
-            if rule:
-                current_rule = rule
-                print(f"[INFO] Rule updated: {current_rule}")
-            else:
-                current_rule = None
-        except Exception as e:
-            print(f"[ERROR] Failed to decode rule JSON: {e}")
-
-def connect_and_subscribe():
-    """ Connects to the MQTT broker and subscribes to config topics. """
+def ensure_mqtt():
+    """Reconnect Wi-Fi, synchronize time and connect MQTT when needed."""
     global mqtt_client
-    mac = ubinascii.hexlify(machine.unique_id()).decode()
-    client_id = f"agrisentry-device-{mac}"
-    
+
+    if mqtt_client is not None:
+        return mqtt_client
+
+    ensure_wifi(
+        config.WIFI_SSID,
+        config.WIFI_PASSWORD,
+        getattr(config, "WIFI_CONNECT_TIMEOUT_SECONDS", 20),
+    )
+
     try:
-        print(f"Attempting to connect to MQTT broker at {MQTT_BROKER}...")
-        client = MQTTClient(
-            client_id, 
-            MQTT_BROKER, 
-            user=MQTT_USER, 
-            password=MQTT_PASSWORD, 
-            keepalive=60
+        utc_now_iso()
+    except RuntimeError:
+        sync_utc_clock()
+
+    mqtt_client = build_client()
+    return mqtt_client
+
+
+def publish_envelope(envelope):
+    """Publish one envelope using MQTT QoS 1."""
+    client = ensure_mqtt()
+    payload = serialize(envelope).encode("utf-8")
+    client.publish(TELEMETRY_TOPIC, payload, qos=1)
+
+    print(
+        "[MQTT] Published event=%s sequence=%s readings=%s"
+        % (
+            envelope["event_id"],
+            envelope["sequence"],
+            len(envelope["readings"]),
         )
-        client.set_callback(on_message)
-        client.connect()
-        print("[SUCCESS] Connected to MQTT Broker.")
-        
-        response_topic = f"agrisentry/devices/{mac}/config/set"
-        client.subscribe(response_topic)
-        print(f"[MQTT] Subscribed to: {response_topic}")
-        
-        config_topic = f"agrisentry/devices/{mac}/config/get"
-        client.publish(config_topic, b'{}')
-        print(f"[MQTT] Configuration request sent.")
-        
-        mqtt_client = client
-        return True
-    except Exception as e:
-        print(f"[FAILURE] Error connecting to MQTT: {e}")
-        mqtt_client = None
-        return False
+    )
 
-def sync_offline_readings():
-    """ Publishes all cached readings when connection is restored. """
-    if not mqtt_client: return
 
-    print("[SYNC] Checking for offline readings...")
-    lines = cache.get_unsent_readings()
-    if not lines:
-        print("[SYNC] No offline readings to sync.")
+def replay_cache():
+    """Publish cached envelopes and preserve the first unsent item onward."""
+    cached = telemetry_cache.load()
+    if not cached:
         return
 
-    print(f"[SYNC] Found {len(lines)} readings. Sending...")
-    mac = ubinascii.hexlify(machine.unique_id()).decode()
-    telemetry_topic = f"agrisentry/devices/{mac}/telemetry"
-    
-    success = True
-    for i, line in enumerate(lines):
+    print("[CACHE] Replaying %s envelope(s)" % len(cached))
+
+    for index, envelope in enumerate(cached):
         try:
-            mqtt_client.publish(telemetry_topic, line.strip())
-            print(f"  > Sent offline reading {i+1}/{len(lines)}...")
-            time.sleep(0.1) # Prevent network flooding
-        except Exception as e:
-            print(f"[SYNC ERROR] Failed to send reading: {e}. Stopping sync.")
-            success = False
-            break
+            publish_envelope(envelope)
+        except Exception as error:
+            telemetry_cache.replace(cached[index:])
+            print("[CACHE] Replay interrupted:", error)
+            return
 
-    if success:
-        cache.clear_cache()
-    print("[SYNC] Synchronization complete.")
+    telemetry_cache.clear()
+    print("[CACHE] Replay completed")
 
-# --- Main Application Loop ---
-while True:
-    try:
-        # Connection Management
-        if mqtt_client is None:
-            if connect_and_subscribe():
-                sync_offline_readings()
 
-        if mqtt_client:
-            mqtt_client.check_msg()
+def create_telemetry():
+    """Build the next simulated MQTT v1 envelope."""
+    sequence = sequence_store.next()
 
-        # Scheduled Tasks (every 10 seconds)
-        if loop_counter % 10 == 0:
-            readings = read_sensors()
-            
-            if readings:
-                evaluate_rule(readings)
-                
-                sensor_value = readings.get("SOIL_MOISTURE")
-                
-                payload = json.dumps({
-                    "value": sensor_value,
-                    "sensor_type": "SOIL_MOISTURE",
-                    "timestamp": time.time()
-                })
+    if not getattr(config, "SIMULATION_MODE", True):
+        raise RuntimeError(
+            "Physical sensor mode is not implemented in this firmware slice"
+        )
 
-                if mqtt_client:
-                    try:
-                        mac = ubinascii.hexlify(machine.unique_id()).decode()
-                        telemetry_topic = f"agrisentry/devices/{mac}/telemetry"
-                        mqtt_client.publish(telemetry_topic, payload)
-                        print("[MQTT] Online telemetry sent.")
-                    except Exception as e:
-                        print(f"[ERROR] Failed to send telemetry: {e}. Connection lost.")
-                        mqtt_client = None
-                        cache.save_reading(sensor_value, time.time())
-                else:
-                    print("[OFFLINE] No connection. Saving reading to cache.")
-                    cache.save_reading(sensor_value, time.time())
+    readings = read_all(sequence)
 
-        loop_counter += 1
-        time.sleep(1) # Main loop tick
+    return build_envelope(
+        device_id=DEVICE_ID,
+        firmware_version=config.FIRMWARE_VERSION,
+        sequence=sequence,
+        observed_at=utc_now_iso(),
+        readings=readings,
+    )
 
-    except Exception as e:
-        print(f"[FATAL ERROR] Critical error in main loop: {e}")
-        print("Restarting in 10 seconds...")
-        time.sleep(10)
-        machine.reset()
+
+def mark_connection_lost(error):
+    """Dispose the current client after a connectivity failure."""
+    global mqtt_client
+
+    print("[MQTT] Connection lost:", error)
+
+    if mqtt_client is not None:
+        try:
+            mqtt_client.disconnect()
+        except Exception:
+            pass
+
+    mqtt_client = None
+
+
+def run():
+    """Run the resilient device telemetry loop."""
+    print("[APP] Device:", DEVICE_ID)
+    print("[APP] Topic:", TELEMETRY_TOPIC)
+    print("[APP] Simulation mode enabled")
+
+    interval = max(5, getattr(config, "TELEMETRY_INTERVAL_SECONDS", 10))
+
+    while True:
+        try:
+            ensure_mqtt()
+            replay_cache()
+
+            envelope = create_telemetry()
+
+            try:
+                publish_envelope(envelope)
+            except Exception as error:
+                telemetry_cache.append(envelope)
+                mark_connection_lost(error)
+                print("[CACHE] Envelope stored for later replay")
+
+        except Exception as error:
+            print("[APP] Cycle failed:", error)
+
+        time.sleep(interval)
+
+
+run()

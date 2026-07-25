@@ -1,17 +1,20 @@
-# --- Secrets ---
-# Ignore the local config file that contains real passwords!
+# Secrets
 config.py
 
-# --- Cache Files ---
-# Ignore the local database file and any log files
-*.db
+# Device runtime state
+sequence.state
+sequence.state.tmp
+telemetry_cache.jsonl
+telemetry_cache.jsonl.tmp
 *.jsonl
 
-# --- MicroPython Files ---
-# Ignore compiled MicroPython files
-*.pyc
+# Python / MicroPython
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
-# --- IDE / OS Files ---
+# Editors and operating systems
 .vscode/
 .idea/
 .DS_Store
+Thumbs.db
